@@ -66,7 +66,16 @@ func GetAuthMethodAll(pwd, kPath string) []ssh.AuthMethod {
 
 type ErrorHandleFunc func(path1, path2 string, err error)
 
-func uploadFile(sftpClient *sftp.Client, localPath string, remotePath string) error {
+type SshKit struct {
+	sshClient  *ssh.Client
+	sftpClient *sftp.Client
+}
+
+func (kit *SshKit) Close() error {
+	return kit.sshClient.Close()
+}
+
+func (kit *SshKit) uploadFile(localPath string, remotePath string) error {
 	srcFile, err := os.Open(localPath)
 	if handleError(err, "os.Open") {
 		return err
@@ -75,11 +84,18 @@ func uploadFile(sftpClient *sftp.Client, localPath string, remotePath string) er
 		err = srcFile.Close()
 		handleError(err, "srcFile.Close")
 	}()
-	info, err := sftpClient.Stat(remotePath)
-	if info != nil && info.IsDir() {
-		remotePath = path.Join(remotePath, srcFile.Name())
+	info, err := kit.sftpClient.Stat(remotePath)
+	_, localName := path.Split(localPath)
+	if info == nil {
+		remoteDir, _ := path.Split(remotePath)
+		_ = kit.sftpClient.MkdirAll(remoteDir)
+		if remotePath[len(remotePath)-1] == '/' {
+			remotePath = path.Join(remotePath, localName)
+		}
+	} else if info.IsDir() {
+		remotePath = path.Join(remotePath, localName)
 	}
-	dstFile, err := sftpClient.Create(remotePath)
+	dstFile, err := kit.sftpClient.Create(remotePath)
 	if handleError(err, "sftpClient.Create") {
 		return err
 	}
@@ -91,11 +107,11 @@ func uploadFile(sftpClient *sftp.Client, localPath string, remotePath string) er
 	if handleError(err, "io.Copy") {
 		return err
 	}
-	_ = sftpClient.Chmod(remotePath, os.ModePerm)
+	_ = kit.sftpClient.Chmod(remotePath, os.ModePerm)
 	return nil
 }
 
-func uploadDirectory(sftpClient *sftp.Client, localPath string, remotePath string, errHandleFunc ErrorHandleFunc) {
+func (kit *SshKit) uploadDirectory(localPath string, remotePath string, errHandleFunc ErrorHandleFunc) {
 	localFileInfoList, err := ioutil.ReadDir(localPath)
 	if handleError(err, "ReadDir") {
 		errHandleFunc(localPath, remotePath, err)
@@ -106,11 +122,11 @@ func uploadDirectory(sftpClient *sftp.Client, localPath string, remotePath strin
 		localFilePath := path.Join(localPath, localFileInfo.Name())
 		remoteFilePath := path.Join(remotePath, localFileInfo.Name())
 		if localFileInfo.IsDir() {
-			err = sftpClient.MkdirAll(remoteFilePath)
+			err = kit.sftpClient.MkdirAll(remoteFilePath)
 			handleError(err, "MkdirAll")
-			uploadDirectory(sftpClient, localFilePath, remoteFilePath, errHandleFunc)
+			kit.uploadDirectory(localFilePath, remoteFilePath, errHandleFunc)
 		} else {
-			err = uploadFile(sftpClient, localFilePath, remoteFilePath)
+			err = kit.uploadFile(localFilePath, remoteFilePath)
 			if handleError(err, "uploadFile") {
 				errHandleFunc(localFilePath, remoteFilePath, err)
 				//t := append(**failedList, [2]string{localFilePath, remoteFilePath})
@@ -120,8 +136,8 @@ func uploadDirectory(sftpClient *sftp.Client, localPath string, remotePath strin
 	}
 }
 
-func download(sftpClient *sftp.Client, remotePath, localPath string) error {
-	remoteFile, err := sftpClient.Open(remotePath)
+func (kit *SshKit) download(remotePath, localPath string) error {
+	remoteFile, err := kit.sftpClient.Open(remotePath)
 	if handleError(err, "sftpClient.Open") {
 		return err
 	}
@@ -130,8 +146,15 @@ func download(sftpClient *sftp.Client, remotePath, localPath string) error {
 		handleError(err, "remoteFile.Close")
 	}()
 	info, err := os.Stat(localPath)
-	if info != nil && info.IsDir() {
-		localPath = path.Join(localPath, remoteFile.Name())
+	_, remoteName := path.Split(remotePath)
+	if info == nil {
+		localDir, _ := path.Split(localPath)
+		err = os.MkdirAll(localDir, os.ModePerm)
+		if localPath[len(localPath)-1] == '/' {
+			localPath = path.Join(localPath, remoteName)
+		}
+	} else if info.IsDir() {
+		localPath = path.Join(localPath, remoteName)
 	}
 	localFile, err := os.Create(localPath)
 	if handleError(err, "os.Create") {
@@ -149,8 +172,8 @@ func download(sftpClient *sftp.Client, remotePath, localPath string) error {
 	return nil
 }
 
-func downloadDirectory(sftpClient *sftp.Client, remotePath string, localPath string, errHandleFunc ErrorHandleFunc) {
-	remoteFileInfoList, err := sftpClient.ReadDir(localPath)
+func (kit *SshKit) downloadDirectory(remotePath string, localPath string, errHandleFunc ErrorHandleFunc) {
+	remoteFileInfoList, err := kit.sftpClient.ReadDir(remotePath)
 	if handleError(err, "sftpClient.ReadDir") {
 		errHandleFunc(remotePath, localPath, err)
 		return
@@ -162,10 +185,10 @@ func downloadDirectory(sftpClient *sftp.Client, remotePath string, localPath str
 		if remoteFileInfo.IsDir() {
 			err = os.MkdirAll(localFilePath, os.ModePerm)
 			handleError(err, "MkdirAll")
-			downloadDirectory(sftpClient, remoteFilePath, localFilePath, errHandleFunc)
+			kit.downloadDirectory(remoteFilePath, localFilePath, errHandleFunc)
 		} else {
-			err = download(sftpClient, remoteFilePath, localFilePath)
-			if handleError(err, "uploadFile") {
+			err = kit.download(remoteFilePath, localFilePath)
+			if handleError(err, "download") {
 				errHandleFunc(remoteFilePath, localFilePath, err)
 			}
 		}
@@ -175,20 +198,29 @@ func downloadDirectory(sftpClient *sftp.Client, remotePath string, localPath str
 func main() {
 	host := "127.0.0.1"
 	port := "2200"
-	user := "alone"
+	user := "root"
 	pwd := "123456"
 	kPath := "~/.ssh"
 	auth := GetAuthMethodAll(pwd, kPath)
-	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%s", host, port),
+	sshClient, err := ssh.Dial("tcp", fmt.Sprintf("%s:%s", host, port),
 		&ssh.ClientConfig{
 			User:            user,
 			Auth:            auth,
 			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		})
 	handleError(err, "Dial", true)
-	session, err := client.NewSession()
+	session, err := sshClient.NewSession()
 	handleError(err, "new session", true)
 	out, err := session.Output("echo aaa")
 	fmt.Println(string(out))
 	defer session.Close()
+	sftpClient, err := sftp.NewClient(sshClient)
+	sshKit := SshKit{
+		sshClient:  sshClient,
+		sftpClient: sftpClient,
+	}
+	_ = sshKit.download("/tmp/a.txt", "d:/")
+	sshKit.downloadDirectory("/root/", "e:/root", func(path1, path2 string, err error) {
+		fmt.Println("download error:", path1, path2, err)
+	})
 }
